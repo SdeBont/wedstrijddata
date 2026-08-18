@@ -6,8 +6,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 RUN playwright install chromium
 
-COPY app_new.py .
+COPY app.py .
 
 EXPOSE 8080
 
-CMD ["python", "app_new.py"]
+CMD ["python", "app.py"]
