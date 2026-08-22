@@ -850,7 +850,14 @@ def extract_events(page) -> dict:
     while i < len(lines):
         line = lines[i]
 
-        if line == '1E HELFT':
+        if line == '1E HELFT' or line.startswith('1E HELFT '):
+            # Score may be on next line (finished match) or inline (live match format)
+            rest = line[len('1E HELFT'):].strip()
+            hsm = SCORE_PAT.match(rest) if rest else None
+            if hsm:
+                data["halftime_score"] = f"{hsm.group(1)}-{hsm.group(2)}"
+                i += 1
+                continue
             if i + 1 < len(lines):
                 hsm = SCORE_PAT.match(lines[i + 1])
                 if hsm:
@@ -860,7 +867,7 @@ def extract_events(page) -> dict:
             i += 1
             continue
 
-        if line == '2E HELFT':
+        if line == '2E HELFT' or line.startswith('2E HELFT '):
             skip_next_score = True
             i += 1
             continue
@@ -1458,91 +1465,123 @@ def apply_names_to_events(events: list, name_map: dict) -> None:
 # ── Sofascore scraper (page.route → guaranteed body capture) ──────────────────
 
 def scrape_sofascore(url: str) -> str:
-    """Scrape match data from Sofascore.
-    Uses page.route() to intercept api.sofascore.com calls made by Sofascore's
-    own JavaScript — those calls already carry the correct auth tokens, so we
-    get the full response body without any credential handling on our side.
+    """Scrape match data from Sofascore via directe API-aanroepen (geen browser nodig).
+
+    Stap 1: haal de pagina-HTML op om het numerieke event-ID te vinden.
+    Stap 2: roep api.sofascore.com rechtstreeks aan voor event, incidents en lineups.
+    Dit omzeilt Cloudflare-botdetectie die headless browsers blokkeert.
     """
+    import requests as _req
+
+    sess = _req.Session()
+    sess.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "nl-NL,nl;q=0.9,en-US;q=0.8,en;q=0.7",
+    })
+
+    # ── Stap 1: Numeriek event-ID ophalen uit pagina-HTML ────────────────────
+    event_id = None
+    try:
+        page_r = sess.get(
+            url,
+            headers={
+                "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                "Referer": "https://www.google.nl/",
+            },
+            timeout=20,
+            allow_redirects=True,
+        )
+        text = page_r.text
+
+        # Probeer Next.js __NEXT_DATA__ (meest betrouwbaar)
+        ndata_m = re.search(
+            r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+            text, re.DOTALL
+        )
+        if ndata_m:
+            try:
+                ndata = json.loads(ndata_m.group(1))
+
+                def _find_event_id(obj, depth=0):
+                    if depth > 15 or not obj:
+                        return None
+                    if isinstance(obj, dict):
+                        eid = obj.get('id')
+                        if isinstance(eid, int) and eid > 100000:
+                            if 'homeTeam' in obj or 'homeScore' in obj or 'awayTeam' in obj:
+                                return str(eid)
+                        for v in obj.values():
+                            r2 = _find_event_id(v, depth + 1)
+                            if r2:
+                                return r2
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            r2 = _find_event_id(item, depth + 1)
+                            if r2:
+                                return r2
+                    return None
+
+                event_id = _find_event_id(ndata)
+            except Exception:
+                pass
+
+        # Fallback: zoek numeriek ID in HTML met diverse patronen
+        if not event_id:
+            for pat in [
+                r'"id"\s*:\s*(\d{7,})\s*,\s*"customId"',
+                r'"event"\s*:\s*\{[^{}]{0,200}"id"\s*:\s*(\d{7,})',
+                r'"id"\s*:\s*(\d{7,})',
+            ]:
+                m2 = re.search(pat, text)
+                if m2:
+                    event_id = m2.group(1)
+                    break
+    except Exception:
+        pass
+
+    if not event_id:
+        raise ValueError(
+            "Geen data ontvangen van Sofascore. "
+            "Controleer de URL of probeer een Flashscore-link."
+        )
+
+    # ── Stap 2: Sofascore API rechtstreeks aanroepen ──────────────────────────
+    api_hdrs = {
+        "Accept": "*/*",
+        "Accept-Language": "nl-NL,nl;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://www.sofascore.com/",
+        "Origin": "https://www.sofascore.com",
+        "Cache-Control": "no-cache",
+    }
+
+    def _api_get(path):
+        r = sess.get(
+            f"https://api.sofascore.com/api/v1/{path}",
+            headers=api_hdrs,
+            timeout=15,
+        )
+        r.raise_for_status()
+        return r.json()
+
     captured: dict = {}
+    try:
+        captured['event'] = _api_get(f"event/{event_id}").get('event')
+    except Exception as e:
+        raise ValueError(f"Sofascore API onbereikbaar: {e}")
 
-    def _ss_route_handler(route):
-        try:
-            resp = route.fetch()
-            body = resp.body()
-            req_url = route.request.url
-            if body:
-                try:
-                    data = json.loads(body)
-                    if '/lineups' in req_url:
-                        captured['lineups'] = data
-                    elif '/incidents' in req_url:
-                        captured['incidents'] = data.get('incidents', [])
-                    elif re.search(r'/event/\d+/?$', req_url):
-                        captured['event'] = data.get('event')
-                except Exception:
-                    pass
-            route.fulfill(response=resp)
-        except Exception:
-            try:
-                route.continue_()
-            except Exception:
-                pass
+    try:
+        captured['incidents'] = _api_get(f"event/{event_id}/incidents").get('incidents', [])
+    except Exception:
+        captured['incidents'] = []
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
-        )
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 900},
-            locale="nl-NL",
-        )
-        page = context.new_page()
-
-        # Intercept ALL Sofascore API calls before navigating
-        page.route("https://api.sofascore.com/**", _ss_route_handler)
-
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(3000)
-
-            # Dismiss cookie banner
-            try:
-                page.click("button#onetrust-accept-btn-handler", timeout=3000)
-                page.wait_for_timeout(500)
-            except Exception:
-                pass
-
-            # Wait for incidents (poll up to 10 s)
-            for _ in range(20):
-                if 'incidents' in captured:
-                    break
-                page.wait_for_timeout(500)
-
-            # Click lineups tab to trigger lineup API call
-            for label in ("Opstellingen", "OPSTELLINGEN", "Lineups", "LINEUPS"):
-                try:
-                    page.get_by_text(label, exact=True).first.click(timeout=3000)
-                    break
-                except Exception:
-                    pass
-
-            # Wait for lineups (poll up to 10 s)
-            for _ in range(20):
-                if 'lineups' in captured:
-                    break
-                page.wait_for_timeout(500)
-
-        finally:
-            try:
-                browser.close()
-            except Exception:
-                pass
+    try:
+        captured['lineups'] = _api_get(f"event/{event_id}/lineups")
+    except Exception:
+        captured['lineups'] = {}
 
     if not captured.get('event') and not captured.get('incidents'):
         raise ValueError(
@@ -1651,6 +1690,35 @@ def scrape_match(url: str) -> str:
         )
         page = context.new_page()
 
+        # Network-level response capture — fires for ALL responses including those
+        # served by the Flashscore Service Worker (sw.js), which bypasses the in-page
+        # fetch/XHR monitor (_FS_MONITOR) for cached/live-match data.
+        _net_div_responses  = []  # ÷-delimited feed responses
+        _net_json_responses = []  # JSON responses (lineup data etc.)
+
+        def _on_response(response):
+            try:
+                url_r = response.url
+                # Skip static assets quickly
+                if re.search(r'\.(js|css|png|jpg|gif|svg|woff|woff2|ico|webp)(\?|$)',
+                             url_r, re.I):
+                    return
+                # Only process Flashscore data-feed URLs
+                if not any(x in url_r for x in
+                           ('d.flashscore', 'flashscore.ninja', '/x/feed/', 'x/feed')):
+                    return
+                body = response.text()
+                if not body:
+                    return
+                if '÷' in body:
+                    _net_div_responses.append(body)
+                elif 50 < len(body) < 500_000:
+                    _net_json_responses.append(body[:30_000])
+            except Exception:
+                pass
+
+        page.on('response', _on_response)
+
         # Inject monitor script BEFORE navigation so it patches fetch/XHR from
         # the very first request. Capturing inside the browser avoids the
         # double-fetch problem that caused Flashscore to block our route handler.
@@ -1692,6 +1760,75 @@ def scrape_match(url: str) -> str:
 
             summary = extract_events(page)
 
+            # ── Enrich event player names from SAMENVATTING slug links ────────────
+            # Player profile links (/speler/surname-firstname/ID/) are present on the
+            # SAMENVATTING tab for goal scorers / card recipients.  Extracting full
+            # names here means we don't need ÷-API data for live-match events.
+            _samenvatting_slug_map: dict = {}
+            try:
+                _samenvatting_slug_map = page.evaluate(r"""(function() {
+                    var nameMap = {};
+                    document.querySelectorAll('a[href*="/speler/"],a[href*="/player/"]')
+                        .forEach(function(a) {
+                            var href = a.getAttribute('href') || '';
+                            var m = href.match(
+                                /\/(?:speler|player)\/([a-z][a-z0-9-]+)\/[A-Za-z0-9]{4,}/i);
+                            if (!m) return;
+                            var slug = m[1];
+                            if (slug.indexOf('-') < 0) return;
+                            // Extract displayed (abbreviated) name from the link text
+                            var rawText = (a.innerText || a.textContent || '').trim();
+                            var lines = rawText.split(/[\r\n]+/).map(function(l){return l.trim();});
+                            var short = '';
+                            for (var li = 0; li < lines.length; li++) {
+                                var l = lines[li];
+                                if (l && /[A-Za-zÀ-ɏ]/.test(l)
+                                       && !/^\d+$/.test(l)
+                                       && !/^\(\w\)$/.test(l)
+                                       && !/^\d+[.']/.test(l)) {
+                                    short = l; break;
+                                }
+                            }
+                            if (!short || short.length < 2) return;
+                            // Convert slug to full name using the initial from abbreviated name
+                            var slugParts = slug.split('-');
+                            var shortParts = short.trim().split(/\s+/);
+                            var lastToken  = shortParts[shortParts.length - 1].replace(/\.$/, '');
+                            var surnameFromAbbrev = shortParts.slice(0, -1).join(' ');
+                            if (lastToken.length === 1 && /^[a-zA-Z]$/.test(lastToken)) {
+                                var initial = lastToken.toLowerCase();
+                                var surnameWords = shortParts.slice(0, -1)
+                                    .map(function(w){ return w.toLowerCase(); });
+                                var fnIdx = -1;
+                                for (var si = 0; si < slugParts.length; si++) {
+                                    var sp = slugParts[si];
+                                    if (sp.length > 1 && sp[0] === initial
+                                            && surnameWords.indexOf(sp) < 0) {
+                                        fnIdx = si; break;
+                                    }
+                                }
+                                if (fnIdx < 0) return;
+                                var fnParts = [];
+                                for (var fi = fnIdx; fi < slugParts.length; fi++) {
+                                    if (surnameWords.indexOf(slugParts[fi]) >= 0) break;
+                                    fnParts.push(slugParts[fi].charAt(0).toUpperCase()
+                                                 + slugParts[fi].slice(1));
+                                }
+                                var firstname = fnParts.join('-');
+                                var full = firstname + ' ' + surnameFromAbbrev;
+                                if (full && full.length > short.length) nameMap[short] = full;
+                            } else if (short.indexOf(' ') >= 0) {
+                                // Already a full name (e.g. "Weslley Patati") — keep it
+                                nameMap[short] = short;
+                            }
+                        });
+                    return nameMap;
+                })()""")
+                if _samenvatting_slug_map:
+                    apply_names_to_events(summary["events"], _samenvatting_slug_map)
+            except Exception:
+                _samenvatting_slug_map = {}
+
             # Navigate to OPSTELLINGEN tab
             clicked = False
             for label in ("OPSTELLINGEN", "Opstellingen", "LINEUPS", "Lineups"):
@@ -1719,7 +1856,14 @@ def scrape_match(url: str) -> str:
                 # Step 2: give async fetch/clone().text() promises a moment to resolve,
                 # then read all captured API data from the in-page monitor.
                 page.wait_for_timeout(800)
-                api_data = page.evaluate("() => Array.from(window.__fsApiData || [])")
+                _inpage_div  = page.evaluate("() => Array.from(window.__fsApiData  || [])")
+                _inpage_json = page.evaluate("() => Array.from(window.__fsJsonData || [])")
+
+                # Merge in-page monitor data with network-level captured data.
+                # Network-level data captures Service Worker responses that bypass the
+                # in-page fetch/XHR hooks (critical for live and recently played matches).
+                api_data  = list(_inpage_div)  + _net_div_responses
+                json_data = list(_inpage_json) + _net_json_responses
 
                 # Step 3: parse names + match metadata from captured data.
                 api_name_map = parse_api_names(api_data)
@@ -1727,7 +1871,6 @@ def scrape_match(url: str) -> str:
 
                 # Step 3b: also check non-÷ JSON responses (e.g. lineup API via fetch).
                 # These are merged into api_name_map; existing entries win.
-                json_data = page.evaluate("() => Array.from(window.__fsJsonData || [])")
                 json_name_map = parse_json_lineup_names(json_data)
                 for k, v in json_name_map.items():
                     if k not in api_name_map:
@@ -1770,16 +1913,18 @@ def scrape_match(url: str) -> str:
                 apply_names_to_events(summary["events"], api_name_map)
 
                 # Step 4: enrich lineup player names.
-                if api_name_map:
-                    for side in ("home_starters", "away_starters"):
-                        for p in lineups.get(side, []):
-                            name = p["name"]
-                            if name in api_name_map:
-                                p["name"] = api_name_map[name]
-                            elif (name + ".") in api_name_map:
-                                p["name"] = api_name_map[name + "."]
-                            elif name.rstrip(".") in api_name_map:
-                                p["name"] = api_name_map[name.rstrip(".")]
+                # Use combined map: SAMENVATTING slug map + ÷-API map (API takes priority).
+                _lineup_name_map = dict(_samenvatting_slug_map)
+                _lineup_name_map.update(api_name_map)
+                for side in ("home_starters", "away_starters"):
+                    for p in lineups.get(side, []):
+                        name = p["name"]
+                        if name in _lineup_name_map:
+                            p["name"] = _lineup_name_map[name]
+                        elif (name + ".") in _lineup_name_map:
+                            p["name"] = _lineup_name_map[name + "."]
+                        elif name.rstrip(".") in _lineup_name_map:
+                            p["name"] = _lineup_name_map[name.rstrip(".")]
 
             # Debug: schrijf API-data naar bestand naast app.py.
             try:
