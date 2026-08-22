@@ -1690,35 +1690,6 @@ def scrape_match(url: str) -> str:
         )
         page = context.new_page()
 
-        # Network-level response capture — fires for ALL responses including those
-        # served by the Flashscore Service Worker (sw.js), which bypasses the in-page
-        # fetch/XHR monitor (_FS_MONITOR) for cached/live-match data.
-        _net_div_responses  = []  # ÷-delimited feed responses
-        _net_json_responses = []  # JSON responses (lineup data etc.)
-
-        def _on_response(response):
-            try:
-                url_r = response.url
-                # Skip static assets quickly
-                if re.search(r'\.(js|css|png|jpg|gif|svg|woff|woff2|ico|webp)(\?|$)',
-                             url_r, re.I):
-                    return
-                # Only process Flashscore data-feed URLs
-                if not any(x in url_r for x in
-                           ('d.flashscore', 'flashscore.ninja', '/x/feed/', 'x/feed')):
-                    return
-                body = response.text()
-                if not body:
-                    return
-                if '÷' in body:
-                    _net_div_responses.append(body)
-                elif 50 < len(body) < 500_000:
-                    _net_json_responses.append(body[:30_000])
-            except Exception:
-                pass
-
-        page.on('response', _on_response)
-
         # Inject monitor script BEFORE navigation so it patches fetch/XHR from
         # the very first request. Capturing inside the browser avoids the
         # double-fetch problem that caused Flashscore to block our route handler.
@@ -1856,14 +1827,8 @@ def scrape_match(url: str) -> str:
                 # Step 2: give async fetch/clone().text() promises a moment to resolve,
                 # then read all captured API data from the in-page monitor.
                 page.wait_for_timeout(800)
-                _inpage_div  = page.evaluate("() => Array.from(window.__fsApiData  || [])")
-                _inpage_json = page.evaluate("() => Array.from(window.__fsJsonData || [])")
-
-                # Merge in-page monitor data with network-level captured data.
-                # Network-level data captures Service Worker responses that bypass the
-                # in-page fetch/XHR hooks (critical for live and recently played matches).
-                api_data  = list(_inpage_div)  + _net_div_responses
-                json_data = list(_inpage_json) + _net_json_responses
+                api_data  = page.evaluate("() => Array.from(window.__fsApiData  || [])")
+                json_data = page.evaluate("() => Array.from(window.__fsJsonData || [])")
 
                 # Step 3: parse names + match metadata from captured data.
                 api_name_map = parse_api_names(api_data)
