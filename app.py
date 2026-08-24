@@ -838,7 +838,7 @@ def extract_events(page) -> dict:
     lines = [l.strip() for l in body.split('\n') if l.strip()]
 
     SCORE_PAT  = re.compile(r'^(\d+)\s*-\s*(\d+)$')
-    MINUTE_PAT = re.compile(r'^(\d+(?:\+\d+)?)\s*\'$')
+    MINUTE_PAT = re.compile(r"^(\d+(?:\+\d+)?)\s*['’ʼ]$")
     REASON_PAT = re.compile(r'^\(([^)]+)\)$')
     RATING_PAT = re.compile(r'^\d+\.\d+$')
 
@@ -1686,7 +1686,11 @@ def scrape_match(url: str) -> str:
                 "Chrome/125.0.0.0 Safari/537.36"
             ),
             viewport={"width": 1280, "height": 900},
-            locale="nl-NL"
+            locale="nl-NL",
+            # Block service workers so Flashscore's sw.js cannot cache API responses
+            # before our _FS_MONITOR fetch/XHR patches intercept them. This is the
+            # main fix for live-match data being empty.
+            service_workers="block",
         )
         page = context.new_page()
 
