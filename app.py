@@ -903,7 +903,8 @@ def extract_events(page) -> dict:
                     if (not MINUTE_PAT.match(nl) and not SCORE_PAT.match(nl)
                             and nl not in ('1E HELFT', '2E HELFT')
                             and not RATING_PAT.match(nl)
-                            and not REASON_PAT.match(nl)):
+                            and not REASON_PAT.match(nl)
+                            and len(nl) <= 50):  # reject narrative descriptions
                         scorer = nl
                         j += 1
 
