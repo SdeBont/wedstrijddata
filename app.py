@@ -437,6 +437,8 @@ def parse_api_meta(texts: list) -> dict:
     to enable full-name reconstruction via _referee_full_name().
     """
     KEY_MAP = {"REF": "referee", "VEN": "venue", "TWN": "city", "ATT": "attendance"}
+    # AR1/AR2 = assistant referees — we explicitly ignore their slugs
+    ASSISTANT_KEYS = {"AR1", "AR2", "AR3", "VAR", "AVAR"}
     meta: dict = {}
     for text in texts:
         try:
@@ -451,26 +453,47 @@ def parse_api_meta(texts: list) -> dict:
                         pairs.append((k.strip(), v.strip()))
 
                 # ── MIT/MIV metadata pairs ──────────────────────────────────
+                # Also check if this record is for the MAIN referee (MIT÷REF),
+                # and if so, extract the IU slug from the SAME record.
                 if 'MIT' in record:
                     i = 0
+                    record_is_main_ref = False
                     while i < len(pairs):
                         k, v = pairs[i]
                         if k == 'MIT' and v in KEY_MAP and i + 1 < len(pairs):
                             nk, nv = pairs[i + 1]
                             if nk == 'MIV' and nv:
                                 meta[KEY_MAP[v]] = nv
+                                if v == 'REF':
+                                    record_is_main_ref = True
+                        elif k == 'MIT' and v in ASSISTANT_KEYS:
+                            record_is_main_ref = False
                         i += 1
+                    # Extract referee slug from the SAME record as MIT÷REF
+                    if record_is_main_ref and 'referee_slug' not in meta:
+                        for k, v in pairs:
+                            if k == 'IU':
+                                m = re.search(
+                                    r'/(?:scheidsrechter|referee)/([a-z][a-z0-9-]+)/[A-Za-z0-9]+',
+                                    v)
+                                if m:
+                                    meta['referee_slug'] = m.group(1)
+                                    break
 
-                # ── Referee profile URL (IU÷/scheidsrechter/slug/ID/) ───────
-                if 'referee_slug' not in meta:
-                    for k, v in pairs:
-                        if k == 'IU':
-                            m = re.search(
-                                r'/(?:scheidsrechter|referee)/([a-z][a-z0-9-]+)/[A-Za-z0-9]+',
-                                v)
-                            if m:
-                                meta['referee_slug'] = m.group(1)
-                                break
+                # ── Referee profile URL — fallback: any record with IU÷/scheidsrechter/
+                # but only if we haven't found the slug from a REF record yet.
+                elif 'referee_slug' not in meta:
+                    # Skip records that are clearly for assistant referees
+                    pair_keys = {k for k, v in pairs}
+                    if not pair_keys & ASSISTANT_KEYS:
+                        for k, v in pairs:
+                            if k == 'IU':
+                                m = re.search(
+                                    r'/(?:scheidsrechter|referee)/([a-z][a-z0-9-]+)/[A-Za-z0-9]+',
+                                    v)
+                                if m:
+                                    meta['referee_slug'] = m.group(1)
+                                    break
         except Exception:
             pass
 
@@ -806,22 +829,47 @@ def extract_events(page) -> dict:
             pass
 
     # ── Referee: try profile link for full name ───────────────────────────────
+    # Find the MAIN referee link: prefer a link whose nearest section label
+    # says "Scheidsrechter" (not "Grensrechters" / "VAR" / assistant labels).
     try:
         ref_link = page.evaluate("""(function() {
+            // Keywords that indicate an assistant referee section
+            var ASSIST_LABELS = ['grensrechter', 'assistent', 'var', 'video'];
+            function nearestSectionText(el) {
+                // Walk up and backwards to find the nearest heading/label
+                var node = el;
+                for (var depth = 0; depth < 6; depth++) {
+                    if (!node.parentElement) break;
+                    node = node.parentElement;
+                    var prev = node.previousElementSibling;
+                    if (prev) {
+                        var t = (prev.innerText || prev.textContent || '').toLowerCase();
+                        if (t) return t;
+                    }
+                    var t2 = (node.innerText || node.textContent || '').toLowerCase();
+                    if (t2 && t2 !== (el.innerText || '').toLowerCase()) return t2;
+                }
+                return '';
+            }
             var links = document.querySelectorAll('a[href]');
+            var fallback = null;
             for (var i = 0; i < links.length; i++) {
                 var href = links[i].getAttribute('href') || '';
                 if (/\\/scheidsrechter\\/|\\/referee\\//.test(href)) {
                     var m = href.match(/\\/(?:scheidsrechter|referee)\\/([a-z][a-z0-9-]+)\\/[A-Za-z0-9]+/);
                     if (m) {
-                        return {
+                        var ctx = nearestSectionText(links[i]);
+                        var isAssist = ASSIST_LABELS.some(function(w) { return ctx.indexOf(w) !== -1; });
+                        var result = {
                             slug: m[1],
                             text: (links[i].innerText || links[i].textContent || '').trim()
                         };
+                        if (!isAssist) return result;   // main referee found
+                        if (!fallback) fallback = result; // remember first as fallback
                     }
                 }
             }
-            return null;
+            return fallback;
         })()""")
         if ref_link and ref_link.get('slug'):
             data['referee'] = _referee_full_name(
@@ -1862,17 +1910,38 @@ def scrape_match(url: str) -> str:
                 if not summary.get('referee') or summary.get('referee') == api_meta.get('referee'):
                     try:
                         ref_link2 = page.evaluate("""(function() {
+                            var ASSIST_LABELS = ['grensrechter', 'assistent', 'var', 'video'];
+                            function nearestSectionText(el) {
+                                var node = el;
+                                for (var depth = 0; depth < 6; depth++) {
+                                    if (!node.parentElement) break;
+                                    node = node.parentElement;
+                                    var prev = node.previousElementSibling;
+                                    if (prev) {
+                                        var t = (prev.innerText || prev.textContent || '').toLowerCase();
+                                        if (t) return t;
+                                    }
+                                    var t2 = (node.innerText || node.textContent || '').toLowerCase();
+                                    if (t2 && t2 !== (el.innerText || '').toLowerCase()) return t2;
+                                }
+                                return '';
+                            }
                             var links = document.querySelectorAll('a[href]');
+                            var fallback = null;
                             for (var i = 0; i < links.length; i++) {
                                 var href = links[i].getAttribute('href') || '';
                                 if (/\\/scheidsrechter\\/|\\/referee\\//.test(href)) {
                                     var m = href.match(/\\/(?:scheidsrechter|referee)\\/([a-z][a-z0-9-]+)\\/[A-Za-z0-9]+/);
                                     if (m) {
-                                        return { slug: m[1], text: (links[i].innerText || links[i].textContent || '').trim() };
+                                        var ctx = nearestSectionText(links[i]);
+                                        var isAssist = ASSIST_LABELS.some(function(w) { return ctx.indexOf(w) !== -1; });
+                                        var result = { slug: m[1], text: (links[i].innerText || links[i].textContent || '').trim() };
+                                        if (!isAssist) return result;
+                                        if (!fallback) fallback = result;
                                     }
                                 }
                             }
-                            return null;
+                            return fallback;
                         })()""")
                         if ref_link2 and ref_link2.get('slug'):
                             full_ref = _referee_full_name(ref_link2['slug'], ref_link2.get('text', ''))
