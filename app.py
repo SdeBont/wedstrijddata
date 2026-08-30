@@ -437,9 +437,11 @@ def parse_api_meta(texts: list) -> dict:
     to enable full-name reconstruction via _referee_full_name().
     """
     KEY_MAP = {"REF": "referee", "VEN": "venue", "TWN": "city", "ATT": "attendance"}
-    # AR1/AR2 = assistant referees — we explicitly ignore their slugs
-    ASSISTANT_KEYS = {"AR1", "AR2", "AR3", "VAR", "AVAR"}
     meta: dict = {}
+    # Collect ALL person records that have a /scheidsrechter/ URL, keyed by (surname, initial)
+    # so we can later match the main referee's abbreviated name to the right person.
+    ref_slug_by_name: dict = {}  # (surname_lower, initial_upper) -> slug
+
     for text in texts:
         try:
             for record in text.split('~'):
@@ -452,50 +454,54 @@ def parse_api_meta(texts: list) -> dict:
                         k, v = pair.split('÷', 1)
                         pairs.append((k.strip(), v.strip()))
 
+                pair_dict = {}
+                for k, v in pairs:
+                    if k not in pair_dict:
+                        pair_dict[k] = v
+
                 # ── MIT/MIV metadata pairs ──────────────────────────────────
-                # Also check if this record is for the MAIN referee (MIT÷REF),
-                # and if so, extract the IU slug from the SAME record.
                 if 'MIT' in record:
                     i = 0
-                    record_is_main_ref = False
                     while i < len(pairs):
                         k, v = pairs[i]
                         if k == 'MIT' and v in KEY_MAP and i + 1 < len(pairs):
                             nk, nv = pairs[i + 1]
                             if nk == 'MIV' and nv:
                                 meta[KEY_MAP[v]] = nv
-                                if v == 'REF':
-                                    record_is_main_ref = True
-                        elif k == 'MIT' and v in ASSISTANT_KEYS:
-                            record_is_main_ref = False
                         i += 1
-                    # Extract referee slug from the SAME record as MIT÷REF
-                    if record_is_main_ref and 'referee_slug' not in meta:
-                        for k, v in pairs:
-                            if k == 'IU':
-                                m = re.search(
-                                    r'/(?:scheidsrechter|referee)/([a-z][a-z0-9-]+)/[A-Za-z0-9]+',
-                                    v)
-                                if m:
-                                    meta['referee_slug'] = m.group(1)
-                                    break
 
-                # ── Referee profile URL — fallback: any record with IU÷/scheidsrechter/
-                # but only if we haven't found the slug from a REF record yet.
-                elif 'referee_slug' not in meta:
-                    # Skip records that are clearly for assistant referees
-                    pair_keys = {k for k, v in pairs}
-                    if not pair_keys & ASSISTANT_KEYS:
-                        for k, v in pairs:
-                            if k == 'IU':
-                                m = re.search(
-                                    r'/(?:scheidsrechter|referee)/([a-z][a-z0-9-]+)/[A-Za-z0-9]+',
-                                    v)
-                                if m:
-                                    meta['referee_slug'] = m.group(1)
-                                    break
+                # ── Collect person records with referee profile URLs ─────────
+                # A person record has NA (surname) + IU (profile URL with /scheidsrechter/)
+                if 'IU' in pair_dict and 'NA' in pair_dict:
+                    iu_val = pair_dict['IU']
+                    m = re.search(
+                        r'/(?:scheidsrechter|referee)/([a-z][a-z0-9-]+)/[A-Za-z0-9]+',
+                        iu_val)
+                    if m:
+                        slug = m.group(1)
+                        surname = pair_dict['NA'].lower()
+                        firstname_initial = pair_dict.get('FI', '')[:1].upper()
+                        if surname and firstname_initial:
+                            ref_slug_by_name[(surname, firstname_initial)] = slug
+                        # Also store by slug parts for fallback
+                        if surname:
+                            ref_slug_by_name[(surname, '')] = slug
+
         except Exception:
             pass
+
+    # Match the main referee's abbreviated name ("Blank E.") to the collected slugs
+    if meta.get('referee') and not meta.get('referee_slug'):
+        abbrev = meta['referee'].strip()
+        parts = abbrev.split()
+        if len(parts) >= 2:
+            surname_lower = ' '.join(parts[:-1]).lower()
+            initial = parts[-1].rstrip('.').upper()
+            if len(initial) == 1:
+                slug = (ref_slug_by_name.get((surname_lower, initial))
+                        or ref_slug_by_name.get((surname_lower, '')))
+                if slug:
+                    meta['referee_slug'] = slug
 
     # If we found both the abbreviated name and a slug, upgrade to full name
     if meta.get('referee_slug') and meta.get('referee'):
