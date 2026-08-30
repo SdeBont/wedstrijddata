@@ -1187,17 +1187,23 @@ def extract_lineups(page, summary: dict, api_name_map: dict = None) -> dict:
             // semicolons between goalkeeper / defenders / midfielders / forwards.
             function enrichWithGroups(sideEl) {
                 try {
-                    var lineEls = Array.from(sideEl.querySelectorAll('[class]'))
-                        .filter(function(e) {
-                            return Array.from(e.classList).some(function(c) {
-                                return c === 'lf__line' || /^lf__line[^A-Za-z]/.test(c);
+                    // Try multiple selector patterns Flashscore may use
+                    var SELECTORS = [
+                        '[class*="lf__line"]',
+                        '[class*="lineUp__line"]',
+                        '[class*="lineup__line"]',
+                        '[class*="formation__line"]',
+                        '[class*="fieldLine"]',
+                    ];
+                    var lineEls = null;
+                    for (var si = 0; si < SELECTORS.length; si++) {
+                        var cands = Array.from(sideEl.querySelectorAll(SELECTORS[si]))
+                            .filter(function(e) {
+                                return (e.innerText || '').trim().length > 2;
                             });
-                        })
-                        .filter(function(e) {
-                            // Only keep elements that actually contain player text
-                            return (e.innerText || '').trim().length > 2;
-                        });
-                    if (lineEls.length >= 3) {
+                        if (cands.length >= 2) { lineEls = cands; break; }
+                    }
+                    if (lineEls && lineEls.length >= 2) {
                         return lineEls.map(function(le) { return enrich(le); })
                                       .join('\n___GROUP___\n');
                     }
@@ -1319,8 +1325,7 @@ def format_report(summary: dict, lineups: dict) -> str:
     events = summary.get("events", [])
 
     out = []
-    # Header: regular hyphen (not em-dash) per FC Utrecht format
-    out.append(f"{home} - {away} {score} ({ht})")
+    out.append(f"{home} – {away} {score} ({ht})")
 
     for ev in events:
         if ev["type"] == "goal":
@@ -1405,10 +1410,8 @@ def format_report(summary: dict, lineups: dict) -> str:
         return ", ".join(_fmt_player_with_sub(p, sub_map) for p in starters) + "."
 
     out.append("")
-    out.append(f"Opstelling {home}:")
-    out.append(format_lineup(lineups.get("home_starters", []), home_sub_map))
-    out.append(f"Opstelling {away}:")
-    out.append(format_lineup(lineups.get("away_starters", []), away_sub_map))
+    out.append(f"Opstelling {home}: " + format_lineup(lineups.get("home_starters", []), home_sub_map))
+    out.append(f"Opstelling {away}: " + format_lineup(lineups.get("away_starters", []), away_sub_map))
 
     return "\n".join(out)
 
@@ -1655,10 +1658,14 @@ def scrape_sofascore(url: str) -> str:
         raw_players = [pl for pl in side_data.get("players", [])
                        if not pl.get("substitute", False)]
         raw_players.sort(key=lambda pl: pos_order.get(pl.get("position", "M"), 2))
+        prev_pos = None
         for pl in raw_players:
             name   = (pl.get("player") or {}).get("name", "")
             number = str(pl.get("shirtNumber", ""))
-            starters.append({"name": name, "number": number, "role": ""})
+            pos    = pl.get("position", "")
+            new_group = (pos != prev_pos and bool(prev_pos))
+            prev_pos = pos
+            starters.append({"name": name, "number": number, "role": pos, "new_group": new_group})
 
     summary = {
         "home_team": home_team, "away_team": away_team,
