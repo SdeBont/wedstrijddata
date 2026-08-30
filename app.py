@@ -682,6 +682,109 @@ def parse_api_names(texts: list) -> dict:
     return name_map
 
 
+def parse_api_lineup_groups(texts: list) -> dict:
+    """Parse Flashscore ÷-API data to extract lineup player entries with position info.
+
+    Flashscore roster records look like:
+        NA÷Surname¬FI÷Firstname¬SB÷JerseyNo¬PP÷PositionCode¬TM÷TeamSide¬...
+    where PP is position code (1=GK, 2=DEF, 3=MID, 4=FWD or similar strings)
+    and TM is team side (1 or H = home, 2 or A = away).
+
+    Returns dict with 'home' and 'away' keys, each a list of dicts:
+        {'name': 'Firstname Surname', 'new_group': bool}
+    Only returned if we find ≥ 8 players per team with position data.
+    Otherwise returns empty dict so caller falls back to DOM extraction.
+    """
+    # Position codes Flashscore may use (value → sort key 0..3)
+    POS_ORDER = {
+        # Numeric
+        '1': 0, '2': 1, '3': 2, '4': 3,
+        # Letter
+        'G': 0, 'K': 0, 'D': 1, 'M': 2, 'F': 3, 'A': 3,
+        # Full strings
+        'GK': 0, 'GKP': 0,
+        'DEF': 1, 'DF': 1,
+        'MID': 2, 'MF': 2,
+        'FWD': 3, 'ATT': 3,
+    }
+    TEAM_HOME = {'1', 'H', 'home'}
+    TEAM_AWAY = {'2', 'A', 'away'}
+
+    home_players: list = []
+    away_players: list = []
+
+    for text in texts:
+        try:
+            for record in text.split('~'):
+                record = record.strip()
+                if not record:
+                    continue
+                pairs: list = []
+                for pair in record.split('¬'):
+                    if '÷' in pair:
+                        k, v = pair.split('÷', 1)
+                        pairs.append((k.strip(), v.strip()))
+
+                fields = {k: v for k, v in pairs}
+                surname   = fields.get('NA', '')
+                firstname = fields.get('FI', '')
+                if not (surname and firstname and len(firstname) > 1):
+                    continue
+
+                # Need at least one position-like field
+                pos_raw = (fields.get('PP') or fields.get('PO') or
+                           fields.get('PT') or fields.get('TP') or '')
+                if not pos_raw:
+                    continue
+
+                pos_key = pos_raw.strip().upper()
+                if pos_key not in POS_ORDER:
+                    continue
+
+                team_raw = (fields.get('TM') or fields.get('WT') or
+                            fields.get('SI') or '').strip()
+
+                full_name = _fix_particles(f"{firstname} {surname}")
+                entry = {'name': full_name, 'pos': POS_ORDER[pos_key]}
+
+                if team_raw in TEAM_HOME:
+                    home_players.append(entry)
+                elif team_raw in TEAM_AWAY:
+                    away_players.append(entry)
+                else:
+                    # No team field: collect and split by order later
+                    home_players.append(entry)
+
+        except Exception:
+            pass
+
+    def build_grouped(players):
+        if len(players) < 8:
+            return []
+        # Sort by position order
+        players.sort(key=lambda p: p['pos'])
+        result = []
+        prev_pos = None
+        for p in players:
+            new_group = (prev_pos is not None and p['pos'] != prev_pos)
+            result.append({'name': p['name'], 'new_group': new_group})
+            prev_pos = p['pos']
+        return result
+
+    # If no team split happened, try to split the combined list in half
+    if home_players and not away_players:
+        mid = len(home_players) // 2
+        away_players = home_players[mid:]
+        home_players = home_players[:mid]
+
+    home_grouped = build_grouped(home_players)
+    away_grouped = build_grouped(away_players)
+
+    if len(home_grouped) >= 8 and len(away_grouped) >= 8:
+        return {'home': home_grouped, 'away': away_grouped}
+    return {}
+
+
 # ── In-page XHR/fetch monitor script ──────────────────────────────────────────
 # Injected before page load; captures all ÷-containing responses from within
 # the browser itself (correct cookies/headers, no double-fetch, no server blocks).
@@ -2022,6 +2125,31 @@ def scrape_match(url: str) -> str:
                         elif name.rstrip(".") in _lineup_name_map:
                             p["name"] = _lineup_name_map[name.rstrip(".")]
 
+                # Step 4b: if DOM gave no positional groups, try ÷-API lineup parser.
+                home_has_groups = any(p.get("new_group") for p in lineups.get("home_starters", []))
+                if not home_has_groups:
+                    api_lineup = parse_api_lineup_groups(api_data)
+                    if api_lineup:
+                        # Merge names from existing lineup into API-derived groups
+                        # (API names may need enrichment; prefer the already-enriched DOM names)
+                        dom_names_home = [p["name"] for p in lineups.get("home_starters", [])]
+                        dom_names_away = [p["name"] for p in lineups.get("away_starters", [])]
+                        # Only use API lineup if player count matches DOM lineup (±1)
+                        api_home = api_lineup.get('home', [])
+                        api_away = api_lineup.get('away', [])
+                        if (abs(len(api_home) - len(dom_names_home)) <= 1 and
+                                abs(len(api_away) - len(dom_names_away)) <= 1 and
+                                dom_names_home):
+                            # Substitute DOM names into API structure (preserves groups)
+                            for i, p in enumerate(api_home):
+                                if i < len(dom_names_home):
+                                    p["name"] = dom_names_home[i]
+                            for i, p in enumerate(api_away):
+                                if i < len(dom_names_away):
+                                    p["name"] = dom_names_away[i]
+                            lineups["home_starters"] = api_home
+                            lineups["away_starters"] = api_away
+
             # Debug: schrijf API-data naar bestand naast app.py.
             try:
                 import os as _os
@@ -2047,7 +2175,25 @@ def scrape_match(url: str) -> str:
                     _f.write(f"JS nameMap sleutels: {_nm_keys}\n")
                     _f.write(f"Spelerlinks in DOM: {_pl_lnk}\n")
                     _f.write(f"÷-naam-map inhoud: {dict(list(_anm.items())[:20])}\n")
-                    _f.write(f"JSON-naam-map inhoud: {dict(list(_jnm.items())[:20])}\n\n")
+                    _f.write(f"JSON-naam-map inhoud: {dict(list(_jnm.items())[:20])}\n")
+                    # Log field keys from roster records (NA present) to debug position fields
+                    _roster_keys: list = []
+                    for _txt in _ad:
+                        for _rec in _txt.split('~'):
+                            if 'NA÷' in _rec and 'FI÷' in _rec:
+                                _kset = set()
+                                for _pair in _rec.split('¬'):
+                                    if '÷' in _pair:
+                                        _kset.add(_pair.split('÷', 1)[0].strip())
+                                if _kset not in _roster_keys:
+                                    _roster_keys.append(_kset)
+                                if len(_roster_keys) >= 5:
+                                    break
+                        if len(_roster_keys) >= 5:
+                            break
+                    _f.write(f"Velden in roster-records (NA+FI): {_roster_keys[:5]}\n")
+                    _api_lg = parse_api_lineup_groups(_ad)
+                    _f.write(f"API lineup groepen gevonden: home={len(_api_lg.get('home',[]))}, away={len(_api_lg.get('away',[]))}\n\n")
                     for _i, _d in enumerate(_ad):
                         _f.write(f"=== ÷-Response {_i + 1} (len={len(_d)}) ===\n")
                         _f.write(_d)
