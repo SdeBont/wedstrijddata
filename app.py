@@ -1237,12 +1237,12 @@ def extract_lineups(page, summary: dict, api_name_map: dict = None) -> dict:
                 return text;
             }
 
-            // Try to detect positional line groups (lf__line containers).
-            // If found, return groups joined by ___GROUP___ so Python can add
-            // semicolons between goalkeeper / defenders / midfielders / forwards.
+            // Detect positional line groups by Y-position clustering.
+            // Players on the same visual row (within BAND px) belong to the same line.
+            // This is CSS-class-agnostic and survives Flashscore DOM changes.
             function enrichWithGroups(sideEl) {
                 try {
-                    // Try multiple selector patterns Flashscore may use
+                    // --- Approach 1: CSS class selectors (fast, kept as primary) ---
                     var SELECTORS = [
                         '[class*="lf__line"]',
                         '[class*="lineUp__line"]',
@@ -1250,18 +1250,71 @@ def extract_lineups(page, summary: dict, api_name_map: dict = None) -> dict:
                         '[class*="formation__line"]',
                         '[class*="fieldLine"]',
                     ];
-                    var lineEls = null;
                     for (var si = 0; si < SELECTORS.length; si++) {
                         var cands = Array.from(sideEl.querySelectorAll(SELECTORS[si]))
-                            .filter(function(e) {
-                                return (e.innerText || '').trim().length > 2;
+                            .filter(function(e) { return (e.innerText || '').trim().length > 2; });
+                        if (cands.length >= 2) {
+                            return cands.map(function(le) { return enrich(le); })
+                                        .join('\n___GROUP___\n');
+                        }
+                    }
+
+                    // --- Approach 2: Y-position clustering (fallback) ---
+                    // Collect all leaf player-name nodes inside the side element.
+                    // We look for anchor tags (player profile links) as anchors.
+                    var playerAnchors = Array.from(sideEl.querySelectorAll('a[href*="/speler/"],a[href*="/player/"]'));
+                    if (playerAnchors.length < 3) {
+                        // Also try elements whose text looks like a player name (heuristic)
+                        playerAnchors = Array.from(sideEl.querySelectorAll('span,div,a'))
+                            .filter(function(el) {
+                                var t = (el.innerText || el.textContent || '').trim();
+                                // A player name: 2-40 chars, no digits-only, no (K) alone
+                                return t.length >= 2 && t.length <= 40 && !/^\d+$/.test(t)
+                                    && el.children.length === 0;
                             });
-                        if (cands.length >= 2) { lineEls = cands; break; }
                     }
-                    if (lineEls && lineEls.length >= 2) {
-                        return lineEls.map(function(le) { return enrich(le); })
-                                      .join('\n___GROUP___\n');
+                    if (playerAnchors.length < 3) return enrich(sideEl);
+
+                    // Get bounding Y for each anchor
+                    var items = playerAnchors.map(function(el) {
+                        var r = el.getBoundingClientRect();
+                        return { el: el, y: r.top + r.height / 2 };
+                    }).filter(function(it) { return it.y > 0; });
+
+                    if (items.length < 3) return enrich(sideEl);
+
+                    // Sort by Y
+                    items.sort(function(a, b) { return a.y - b.y; });
+
+                    // Cluster: new group when Y gap > BAND px
+                    var BAND = 22;
+                    var groups = [[items[0]]];
+                    for (var ii = 1; ii < items.length; ii++) {
+                        var gap = items[ii].y - items[ii - 1].y;
+                        if (gap > BAND) groups.push([]);
+                        groups[groups.length - 1].push(items[ii]);
                     }
+
+                    // Need at least 2 meaningful groups
+                    if (groups.length < 2) return enrich(sideEl);
+
+                    // For each group, collect names from the matched player text (from nameMap)
+                    // by building a mini-element with just those anchors' text.
+                    return groups.map(function(grp) {
+                        var texts = grp.map(function(it) {
+                            return (it.el.innerText || it.el.textContent || '').trim();
+                        }).filter(Boolean);
+                        var raw = texts.join('\n');
+                        // Apply name enrichment
+                        Object.keys(nameMap)
+                            .sort(function(a, b) { return b.length - a.length; })
+                            .forEach(function(short) {
+                                if (raw.indexOf(short) >= 0)
+                                    raw = raw.split(short).join(nameMap[short]);
+                            });
+                        return raw;
+                    }).join('\n___GROUP___\n');
+
                 } catch(e2) {}
                 return enrich(sideEl);
             }
