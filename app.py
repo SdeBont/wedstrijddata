@@ -1417,7 +1417,7 @@ def format_report(summary: dict, lineups: dict) -> str:
     if red_parts:
         out.append("Rode kaarten: " + ", ".join(red_parts))
 
-    # Toeschouwers — Dutch thousands separator (dot)
+    # Toeschouwers — Dutch thousands separator (dot); always show label
     att = summary.get("attendance", "")
     if att:
         try:
@@ -1427,6 +1427,8 @@ def format_report(summary: dict, lineups: dict) -> str:
         except Exception:
             att_str = str(att)
         out.append(f"Toeschouwers: {att_str}")
+    else:
+        out.append("Toeschouwers: ")
 
     # Substitution maps (player_out -> (minute, player_in))
     home_sub_map: dict = {}
@@ -1458,9 +1460,10 @@ def format_report(summary: dict, lineups: dict) -> str:
         # Flat list (no group data)
         return ", ".join(_fmt_player_with_sub(p, sub_map) for p in starters) + "."
 
-    out.append("")
-    out.append(f"Opstelling {home}: " + format_lineup(lineups.get("home_starters", []), home_sub_map))
-    out.append(f"Opstelling {away}: " + format_lineup(lineups.get("away_starters", []), away_sub_map))
+    out.append(f"Opstelling {home}:")
+    out.append(format_lineup(lineups.get("home_starters", []), home_sub_map))
+    out.append(f"Opstelling {away}:")
+    out.append(format_lineup(lineups.get("away_starters", []), away_sub_map))
 
     return "\n".join(out)
 
@@ -1487,6 +1490,8 @@ def format_report_html(plain_text: str) -> str:
         elif line.startswith("Toeschouwers:"):
             label, _, rest = line.partition(":")
             html_lines.append(f"<strong>{_html.escape(label)}:</strong>{_html.escape(rest)}")
+        elif line.startswith("Opstelling ") and line.endswith(":"):
+            html_lines.append(f"<strong>{esc}</strong>")
         else:
             html_lines.append(esc)
     return "<br>\n".join(html_lines)
