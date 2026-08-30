@@ -1237,12 +1237,13 @@ def extract_lineups(page, summary: dict, api_name_map: dict = None) -> dict:
                 return text;
             }
 
-            // Detect positional line groups by Y-position clustering.
-            // Players on the same visual row (within BAND px) belong to the same line.
-            // This is CSS-class-agnostic and survives Flashscore DOM changes.
+            // Detect positional line groups.
+            // Strategy 1: CSS class selectors (fast).
+            // Strategy 2: Y-position clustering via player profile links.
+            // Fallback: flat text of the whole side element (always works).
             function enrichWithGroups(sideEl) {
                 try {
-                    // --- Approach 1: CSS class selectors (fast, kept as primary) ---
+                    // --- Strategy 1: CSS class selectors ---
                     var SELECTORS = [
                         '[class*="lf__line"]',
                         '[class*="lineUp__line"]',
@@ -1259,63 +1260,48 @@ def extract_lineups(page, summary: dict, api_name_map: dict = None) -> dict:
                         }
                     }
 
-                    // --- Approach 2: Y-position clustering (fallback) ---
-                    // Collect all leaf player-name nodes inside the side element.
-                    // We look for anchor tags (player profile links) as anchors.
+                    // --- Strategy 2: Y-position clustering via player links ---
                     var playerAnchors = Array.from(sideEl.querySelectorAll('a[href*="/speler/"],a[href*="/player/"]'));
-                    if (playerAnchors.length < 3) {
-                        // Also try elements whose text looks like a player name (heuristic)
-                        playerAnchors = Array.from(sideEl.querySelectorAll('span,div,a'))
-                            .filter(function(el) {
-                                var t = (el.innerText || el.textContent || '').trim();
-                                // A player name: 2-40 chars, no digits-only, no (K) alone
-                                return t.length >= 2 && t.length <= 40 && !/^\d+$/.test(t)
-                                    && el.children.length === 0;
-                            });
+                    if (playerAnchors.length >= 8) {
+                        var items = playerAnchors.map(function(el) {
+                            var r = el.getBoundingClientRect();
+                            return { el: el, y: r.top + r.height / 2 };
+                        }).filter(function(it) { return it.y > 0; });
+
+                        if (items.length >= 8) {
+                            items.sort(function(a, b) { return a.y - b.y; });
+
+                            // Cluster: new group when Y gap > BAND px
+                            var BAND = 25;
+                            var groups = [[items[0]]];
+                            for (var ii = 1; ii < items.length; ii++) {
+                                if (items[ii].y - items[ii - 1].y > BAND) groups.push([]);
+                                groups[groups.length - 1].push(items[ii]);
+                            }
+
+                            // Valid formation: 3–5 groups, 8–15 total players
+                            if (groups.length >= 2 && groups.length <= 6 && items.length >= 8) {
+                                var result = groups.map(function(grp) {
+                                    var texts = grp.map(function(it) {
+                                        return (it.el.innerText || it.el.textContent || '').trim();
+                                    }).filter(Boolean);
+                                    var raw = texts.join('\n');
+                                    Object.keys(nameMap)
+                                        .sort(function(a, b) { return b.length - a.length; })
+                                        .forEach(function(short) {
+                                            if (raw.indexOf(short) >= 0)
+                                                raw = raw.split(short).join(nameMap[short]);
+                                        });
+                                    return raw;
+                                }).join('\n___GROUP___\n');
+                                // Sanity: result must contain at least 5 newlines (= 6+ names)
+                                if ((result.match(/\n/g) || []).length >= 5) return result;
+                            }
+                        }
                     }
-                    if (playerAnchors.length < 3) return enrich(sideEl);
-
-                    // Get bounding Y for each anchor
-                    var items = playerAnchors.map(function(el) {
-                        var r = el.getBoundingClientRect();
-                        return { el: el, y: r.top + r.height / 2 };
-                    }).filter(function(it) { return it.y > 0; });
-
-                    if (items.length < 3) return enrich(sideEl);
-
-                    // Sort by Y
-                    items.sort(function(a, b) { return a.y - b.y; });
-
-                    // Cluster: new group when Y gap > BAND px
-                    var BAND = 22;
-                    var groups = [[items[0]]];
-                    for (var ii = 1; ii < items.length; ii++) {
-                        var gap = items[ii].y - items[ii - 1].y;
-                        if (gap > BAND) groups.push([]);
-                        groups[groups.length - 1].push(items[ii]);
-                    }
-
-                    // Need at least 2 meaningful groups
-                    if (groups.length < 2) return enrich(sideEl);
-
-                    // For each group, collect names from the matched player text (from nameMap)
-                    // by building a mini-element with just those anchors' text.
-                    return groups.map(function(grp) {
-                        var texts = grp.map(function(it) {
-                            return (it.el.innerText || it.el.textContent || '').trim();
-                        }).filter(Boolean);
-                        var raw = texts.join('\n');
-                        // Apply name enrichment
-                        Object.keys(nameMap)
-                            .sort(function(a, b) { return b.length - a.length; })
-                            .forEach(function(short) {
-                                if (raw.indexOf(short) >= 0)
-                                    raw = raw.split(short).join(nameMap[short]);
-                            });
-                        return raw;
-                    }).join('\n___GROUP___\n');
-
                 } catch(e2) {}
+
+                // Fallback: flat text (always produces output)
                 return enrich(sideEl);
             }
 
