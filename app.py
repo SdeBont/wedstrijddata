@@ -2013,6 +2013,24 @@ def scrape_match(url: str) -> str:
             except Exception:
                 _samenvatting_slug_map = {}
 
+            # ── Collect API data from SAMENVATTING page (always, before tab switch) ──
+            # This captures referee, attendance, and player name data that is
+            # available regardless of whether the OPSTELLINGEN tab loads.
+            page.wait_for_timeout(500)
+            api_data  = page.evaluate("() => Array.from(window.__fsApiData  || [])")
+            json_data = page.evaluate("() => Array.from(window.__fsJsonData || [])")
+            api_name_map = parse_api_names(api_data)
+            api_meta     = parse_api_meta(api_data)
+
+            # Apply referee and attendance from SAMENVATTING API data immediately
+            if api_meta.get('referee') and not summary.get('referee'):
+                summary['referee'] = api_meta['referee']
+            if api_meta.get('attendance') and not summary.get('attendance'):
+                summary['attendance'] = api_meta['attendance']
+
+            # Enrich events with API names already available
+            apply_names_to_events(summary["events"], api_name_map)
+
             # Navigate to OPSTELLINGEN tab
             clicked = False
             for label in ("OPSTELLINGEN", "Opstellingen", "LINEUPS", "Lineups"):
@@ -2031,6 +2049,26 @@ def scrape_match(url: str) -> str:
                         break
                     except Exception:
                         pass
+            if not clicked:
+                # Try via JavaScript — look for tab buttons/links containing the keyword
+                try:
+                    clicked = page.evaluate("""(function() {
+                        var keywords = ['opstellingen', 'lineups', 'lineup'];
+                        var els = Array.from(document.querySelectorAll('a,button,[role="tab"]'));
+                        for (var i = 0; i < els.length; i++) {
+                            var t = (els[i].innerText || els[i].textContent || '').toLowerCase().trim();
+                            var h = (els[i].getAttribute('href') || '').toLowerCase();
+                            for (var k = 0; k < keywords.length; k++) {
+                                if (t === keywords[k] || h.indexOf(keywords[k]) >= 0) {
+                                    els[i].click();
+                                    return true;
+                                }
+                            }
+                        }
+                        return false;
+                    })()""")
+                except Exception:
+                    pass
 
             lineups = {"home_starters": [], "away_starters": []}
             if clicked:
@@ -2038,12 +2076,12 @@ def scrape_match(url: str) -> str:
                 lineups = extract_lineups(page, summary, api_name_map=None)
 
                 # Step 2: give async fetch/clone().text() promises a moment to resolve,
-                # then read all captured API data from the in-page monitor.
+                # then read all captured API data (now includes OPSTELLINGEN responses).
                 page.wait_for_timeout(800)
                 api_data  = page.evaluate("() => Array.from(window.__fsApiData  || [])")
                 json_data = page.evaluate("() => Array.from(window.__fsJsonData || [])")
 
-                # Step 3: parse names + match metadata from captured data.
+                # Step 3: re-parse with fuller dataset (includes OPSTELLINGEN API calls).
                 api_name_map = parse_api_names(api_data)
                 api_meta     = parse_api_meta(api_data)
 
