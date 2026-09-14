@@ -1892,8 +1892,14 @@ def scrape_match(url: str) -> str:
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
+                "Chrome/131.0.0.0 Safari/537.36"
             ),
+            extra_http_headers={
+                "sec-ch-ua": '''"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"''',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+                "accept-language": "nl-NL,nl;q=0.9,en-US;q=0.8,en;q=0.7",
+            },
             viewport={"width": 1280, "height": 900},
             locale="nl-NL",
             # Block service workers so Flashscore's sw.js cannot cache API responses
