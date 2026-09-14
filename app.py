@@ -1518,7 +1518,8 @@ def format_report(summary: dict, lineups: dict) -> str:
 
     def format_lineup(starters, sub_map):
         if not starters:
-            return "(niet beschikbaar)"
+            _d = summary.get("_opstel_diag", "")
+            return "(niet beschikbaar)" + (f" [debug: {_d}]" if _d else "")
 
         # Check if we have positional group info (from lf__line detection)
         has_groups = any(p.get("new_group") for p in starters)
@@ -1976,16 +1977,18 @@ def scrape_match(url: str) -> str:
                 opstel_url = url.rstrip('/') + '/samenvatting/opstellingen/'
             print(f"[tab] navigeer naar opstellingen URL: {opstel_url}")
             try:
-                # Use JS navigation (looks like in-app SPA click, not Playwright goto)
-                page.evaluate(f"window.location.href = '{opstel_url}'")
-                # Wait for domcontentloaded on the new page
-                page.wait_for_load_state("domcontentloaded", timeout=30000)
-                # Extra wait for React/SPA to hydrate
-                page.wait_for_timeout(3000)
+                page.goto(opstel_url, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(4000)
                 clicked = True
-                print(f"[tab] opstellingen URL geladen via JS nav, title={page.title()!r}")
+                _fp  = page.evaluate("() => document.querySelectorAll('[class*="fp-formation"]').length")
+                _wcl = page.evaluate("() => document.querySelectorAll('[class*="wcl-lineupsParticipantName"]').length")
+                _blen = page.evaluate("() => document.body.innerText.length")
+                _diag = f"titel={page.title()!r} body={_blen} fp={_fp} wcl={_wcl}"
+                summary["_opstel_diag"] = _diag
+                print(f"[tab] {_diag}")
             except Exception as _nav_exc:
                 clicked = False
+                summary["_opstel_diag"] = f"NAV-FOUT: {_nav_exc}"
                 print(f"[tab] MISLUKT — URL navigatie: {_nav_exc}")
 
             lineups = {"home_starters": [], "away_starters": []}
