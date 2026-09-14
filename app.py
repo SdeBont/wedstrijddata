@@ -1136,10 +1136,12 @@ def extract_lineups(page, summary: dict, api_name_map: dict = None) -> dict:
     """Extract starting elevens from the OPSTELLINGEN tab."""
     data = {"home_starters": [], "away_starters": []}
 
-    # Wait for goalkeeper marker to confirm lineup has fully rendered
+    # Wait for new or old lineup elements to confirm lineup has fully rendered
     try:
         page.wait_for_function(
-            "() => document.body.innerText.includes('(K)')",
+            "() => document.querySelector('[class*=\"wcl-lineupsParticipantName\"]') !== null"
+            " || document.querySelector('[class*=\"lf__side\"]') !== null"
+            " || document.body.innerText.includes('(K)')",
             timeout=12000
         )
     except Exception:
@@ -1148,14 +1150,129 @@ def extract_lineups(page, summary: dict, api_name_map: dict = None) -> dict:
     try:
         raw = page.evaluate(r"""
         (function() {
-            // Only elements whose classList contains exactly 'lf__side' as one class
-            // (excludes lf__sidesBox, lf__sides which are containers)
+            // PRIMARY: fp-formation + fp-home/fp-away (new Flashscore layout 2026)
+            var allDivs = Array.from(document.querySelectorAll('div'));
+            var homeSide = null, awaySide = null;
+            for (var i = 0; i < allDivs.length; i++) {
+                var cls = Array.from(allDivs[i].classList).join(' ');
+                if (cls.indexOf('fp-formation') >= 0 && cls.indexOf('fp-home') >= 0) homeSide = allDivs[i];
+                if (cls.indexOf('fp-formation') >= 0 && cls.indexOf('fp-away') >= 0) awaySide = allDivs[i];
+                if (homeSide && awaySide) break;
+            }
+
+            var nameMap = {};
+            var PARTICLES = {van:1,de:1,den:1,der:1,het:1,di:1,da:1,del:1,el:1,le:1,la:1};
+
+            function extractNameFromAnchor(a) {
+                var rawText = (a.innerText || a.textContent || '').trim();
+                if (!rawText) return '';
+                var lines = rawText.split(/[\r\n]+/).map(function(l) { return l.trim(); });
+                for (var li = 0; li < lines.length; li++) {
+                    var l = lines[li];
+                    if (l && /[A-Za-zÀ-ÿ]/.test(l) && !/^\d+$/.test(l) && !/^\(\w\)$/.test(l)) {
+                        return l;
+                    }
+                }
+                return rawText;
+            }
+
+            function slugToFull(slug, short) {
+                var slugParts = slug.split('-');
+                var shortParts = short.trim().split(/\s+/);
+                var lastToken  = shortParts[shortParts.length - 1].replace(/\.$/, '');
+                var surnameFromAbbrev = shortParts.slice(0, -1).join(' ');
+                if (lastToken.length === 1 && /^[a-zA-Z]$/.test(lastToken)) {
+                    var initial = lastToken.toLowerCase();
+                    var surnameWords = shortParts.slice(0, -1).map(function(w) { return w.toLowerCase(); });
+                    surnameWords = surnameWords.concat(surnameWords.map(function(w) {
+                        return w.replace(/[äàáâãå]/g,'a').replace(/[ëèéê]/g,'e')
+                                .replace(/[ïìíî]/g,'i').replace(/[öòóôõø]/g,'o')
+                                .replace(/[üùúû]/g,'u').replace(/ñ/g,'n').replace(/ç/g,'c');
+                    }));
+                    var fnIdx = -1;
+                    for (var si = 0; si < slugParts.length; si++) {
+                        var sp = slugParts[si];
+                        if (sp.length > 1 && sp[0] === initial && surnameWords.indexOf(sp) < 0) {
+                            fnIdx = si; break;
+                        }
+                    }
+                    if (fnIdx < 0) return '';
+                    var fnParts = [];
+                    for (var fi = fnIdx; fi < slugParts.length; fi++) {
+                        if (surnameWords.indexOf(slugParts[fi]) >= 0) break;
+                        fnParts.push(slugParts[fi].charAt(0).toUpperCase() + slugParts[fi].slice(1));
+                    }
+                    return fnParts.join('-') + ' ' + surnameFromAbbrev;
+                } else {
+                    return slugParts.map(function(w) {
+                        return PARTICLES[w] ? w : w.charAt(0).toUpperCase() + w.slice(1);
+                    }).join(' ');
+                }
+            }
+
+            document.querySelectorAll('a[href*="/speler/"],a[href*="/player/"]').forEach(function(a) {
+                var href = a.getAttribute('href') || '';
+                var m = href.match(/\/(?:speler|player)\/([a-z][a-z0-9-]+)\/[A-Za-z0-9]{4,}/i);
+                if (!m) return;
+                var slug = m[1];
+                if (slug.indexOf('-') < 0) return;
+                var short = extractNameFromAnchor(a);
+                if (!short || short.length < 2) return;
+                if (nameMap[short]) return;
+                var full = slugToFull(slug, short);
+                if (full && full !== short) nameMap[short] = full;
+            });
+
+            function extractSide(sideEl) {
+                if (!sideEl) return '';
+                var rows = Array.from(sideEl.querySelectorAll('[class*="fp-row"]'));
+                if (rows.length >= 2) {
+                    return rows.map(function(row) {
+                        var names = Array.from(row.querySelectorAll('[class*="wcl-lineupsParticipantName"]'))
+                            .map(function(el) {
+                                var text = (el.innerText || el.textContent || '').trim();
+                                text = text.replace(/^\d{1,3}\s*[\r\n]+/, '').trim();
+                                if (nameMap[text]) text = nameMap[text];
+                                return text;
+                            })
+                            .filter(Boolean);
+                        return names.join('\n');
+                    }).join('\n___GROUP___\n');
+                }
+                return Array.from(sideEl.querySelectorAll('[class*="wcl-lineupsParticipantName"]'))
+                    .map(function(el) {
+                        var text = (el.innerText || el.textContent || '').trim();
+                        text = text.replace(/^\d{1,3}\s*[\r\n]+/, '').trim();
+                        if (nameMap[text]) text = nameMap[text];
+                        return text;
+                    })
+                    .filter(Boolean).join('\n');
+            }
+
+            if (homeSide && awaySide) {
+                var homeResult = extractSide(homeSide);
+                var awayResult = extractSide(awaySide);
+                if (homeResult && awayResult) {
+                    window.__lastNmSize      = Object.keys(nameMap).length;
+                    window.__lastNmKeys      = Object.keys(nameMap).slice(0, 20);
+                    window.__lastPlayerLinks = document.querySelectorAll('a[href*="/speler/"],a[href*="/player/"]').length;
+                    return {
+                        home: homeResult,
+                        away: awayResult,
+                        nameMapSize:  Object.keys(nameMap).length,
+                        playerLinks:  window.__lastPlayerLinks,
+                        nameMapKeys:  window.__lastNmKeys,
+                        strategy: 'fp-formation',
+                    };
+                }
+            }
+
+            // FALLBACK: old lf__side layout
             var pureSides = Array.from(document.querySelectorAll('[class*="lf__side"]'))
                 .filter(function(el) {
                     return Array.from(el.classList).some(function(c) { return c === 'lf__side'; });
                 });
 
-            // Starter sides have exactly ONE (K) goalkeeper marker + jersey numbers
             var starterSides = pureSides.filter(function(el) {
                 var text = (el.innerText || el.textContent || '').trim();
                 var kCount = (text.match(/\(K\)/g) || []).length;
@@ -1169,202 +1286,18 @@ def extract_lineups(page, summary: dict, api_name_map: dict = None) -> dict:
                 if (filled.length >= 2) starterSides = filled;
             }
 
-            // Strategy B: content-based — survives CSS class renames
-            if (starterSides.length < 2) {
-                var ALL_TAGS = ['div','section','ul','ol','article'];
-                var candidates = [];
-                ALL_TAGS.forEach(function(tag) {
-                    Array.from(document.querySelectorAll(tag)).forEach(function(el) {
-                        var text = (el.innerText || el.textContent || '').trim();
-                        var kCount = (text.match(/\(K\)/g) || []).length;
-                        if (kCount !== 1) return;
-                        var links = el.querySelectorAll('a[href*="/speler/"],a[href*="/player/"]');
-                        if (links.length < 8) return;
-                        var innerK = Array.from(el.querySelectorAll(tag)).filter(function(child) {
-                            var ct = (child.innerText || child.textContent || '').trim();
-                            return (ct.match(/\(K\)/g) || []).length === 1
-                                   && child.querySelectorAll('a[href*="/speler/"],a[href*="/player/"]').length >= 8;
-                        });
-                        if (innerK.length > 0) return;
-                        candidates.push(el);
-                    });
-                });
-                candidates = candidates.filter(function(el) {
-                    return !candidates.some(function(other) {
-                        return other !== el && el.contains(other);
-                    });
-                });
-                if (candidates.length >= 2) {
-                    starterSides = candidates.slice(0, 2);
-                }
-            }
-
             if (starterSides.length < 2) {
                 return { home: '', away: '',
-                         debug: 'sides_not_found lf__side_count=' +
+                         debug: 'sides_not_found fp-formation=' +
+                             document.querySelectorAll('[class*="fp-formation"]').length +
+                             ' lf__side_count=' +
                              document.querySelectorAll('[class*="lf__side"]').length +
-                             ' K_count=' + (document.body.innerText.match(/\(K\)/g)||[]).length };
+                             ' wcl-names=' +
+                             document.querySelectorAll('[class*="wcl-lineupsParticipantName"]').length };
             }
-
-            // Build a map of abbreviated name -> full name from multiple sources
-            var nameMap = {};
-
-            // Source 1: React component fiber data (Flashscore is a React SPA)
-            (function() {
-                try {
-                    var root = document.querySelector('#app,#root,[id*="root"]');
-                    if (!root) return;
-                    var fkey = Object.keys(root).find(function(k) {
-                        return k.indexOf('__reactFiber') === 0 || k.indexOf('__reactContainer') === 0;
-                    });
-                    if (!fkey) return;
-                    function walk(node, depth) {
-                        if (!node || depth > 30) return;
-                        var p = node.memoizedProps || node.pendingProps || {};
-                        // Various field names Flashscore might use
-                        ['playerName','name','fullName','participantName'].forEach(function(fn) {
-                            ['shortName','displayName','nameShort','shortDisplayName'].forEach(function(sn) {
-                                if (p[fn] && p[sn] && p[fn] !== p[sn]) {
-                                    nameMap[p[sn]] = p[fn];
-                                }
-                            });
-                        });
-                        walk(node.child, depth + 1);
-                        walk(node.sibling, depth + 1);
-                    }
-                    walk(root[fkey], 0);
-                } catch(e) {}
-            })();
-
-            // Source 2: player profile link URL slugs in lf__side elements
-            // Flashscore slug order is surname-first, e.g. sorensen-elias → "Elias Sorensen"
-            // We use the initial from the abbreviated display name to identify the firstname part.
-            var PARTICLES = {van:1,de:1,den:1,der:1,het:1,di:1,da:1,del:1,el:1,le:1,la:1};
-
-            function slugToFull(slug, short) {
-                // short = abbreviated name like "Unnerstall L." or "van Rooij B."
-                // slug  = flashscore slug like "unnerstall-lars" or "van-rooij-bart"
-                // Returns full name like "Lars Unnerstall" or "Bart van Rooij",
-                // using the original surname spelling from `short` (preserves diacritics).
-                var slugParts = slug.split('-');
-                var shortParts = short.trim().split(/\s+/);
-                var lastToken  = shortParts[shortParts.length - 1].replace(/\.$/, '');
-                var surnameFromAbbrev = shortParts.slice(0, -1).join(' '); // e.g. "Pröpper" (keeps ö)
-
-                if (lastToken.length === 1 && /^[a-zA-Z]$/.test(lastToken)) {
-                    var initial = lastToken.toLowerCase();
-                    // surname words lowercased for exclusion check
-                    var surnameWords = shortParts.slice(0, -1).map(function(w) { return w.toLowerCase(); });
-                    // Also include ASCII-folded versions (e.g. "pröpper" → "propper")
-                    surnameWords = surnameWords.concat(surnameWords.map(function(w) {
-                        return w.replace(/[äàáâãå]/g,'a').replace(/[ëèéê]/g,'e')
-                                .replace(/[ïìíî]/g,'i').replace(/[öòóôõø]/g,'o')
-                                .replace(/[üùúû]/g,'u').replace(/ñ/g,'n').replace(/ç/g,'c');
-                    }));
-                    var fnIdx = -1;
-                    for (var si = 0; si < slugParts.length; si++) {
-                        var sp = slugParts[si];
-                        if (sp.length > 1 && sp[0] === initial && surnameWords.indexOf(sp) < 0) {
-                            fnIdx = si;
-                            break;
-                        }
-                    }
-                    if (fnIdx < 0) return '';
-                    // Collect ALL parts from fnIdx onwards that are not surname parts
-                    // This handles hyphenated names like Ro-Zangelo (slug: daal-ro-zangelo)
-                    var fnParts = [];
-                    for (var fi = fnIdx; fi < slugParts.length; fi++) {
-                        if (surnameWords.indexOf(slugParts[fi]) >= 0) break;
-                        fnParts.push(slugParts[fi].charAt(0).toUpperCase() + slugParts[fi].slice(1));
-                    }
-                    var firstname = fnParts.join('-');
-                    // Use the original abbreviated surname to preserve diacritics (e.g. ö, ü)
-                    return firstname + ' ' + surnameFromAbbrev;
-                } else {
-                    // No initial pattern — title-case the whole slug (less reliable)
-                    return slugParts.map(function(w) {
-                        return PARTICLES[w] ? w : w.charAt(0).toUpperCase() + w.slice(1);
-                    }).join(' ');
-                }
-            }
-
-            function extractNameFromAnchor(a) {
-                // Flashscore sometimes wraps number + name in one <a>; isolate the name part.
-                var rawText = (a.innerText || a.textContent || '').trim();
-                if (!rawText) return '';
-                // Split by newline and pick the first line that looks like a player name:
-                // contains at least one letter, is not purely numeric, not a role marker like (K)
-                var lines = rawText.split(/[\r\n]+/).map(function(l) { return l.trim(); });
-                for (var li = 0; li < lines.length; li++) {
-                    var l = lines[li];
-                    if (l && /[A-Za-zÀ-ÖØ-öø-ÿ]/.test(l) && !/^\d+$/.test(l) && !/^\(\w\)$/.test(l) && !/^\d+[.'']/.test(l)) {
-                        return l;
-                    }
-                }
-                return rawText; // fallback: use full text
-            }
-
-            [starterSides[0], starterSides[1]].forEach(function(el) {
-                el.querySelectorAll('a[href]').forEach(function(a) {
-                    var href = a.getAttribute('href') || '';
-                    var m = href.match(/\/(?:speler|player)\/([a-z][a-z0-9-]+)\/[A-Za-z0-9]{4,}/i);
-                    if (!m) return;
-                    var slug = m[1];
-                    if (slug.indexOf('-') < 0) return;
-                    var short = extractNameFromAnchor(a);
-                    if (!short || short.length < 2) return;
-                    var full = slugToFull(slug, short);
-                    if (full && full !== short) nameMap[short] = full;
-                });
-            });
-
-            // Source 3b: scan ALL player links on the page (catches players not in lf__side links)
-            document.querySelectorAll('a[href*="/speler/"],a[href*="/player/"]').forEach(function(a) {
-                var href = a.getAttribute('href') || '';
-                var m = href.match(/\/(?:speler|player)\/([a-z][a-z0-9-]+)\/[A-Za-z0-9]{4,}/i);
-                if (!m) return;
-                var slug = m[1];
-                if (slug.indexOf('-') < 0) return;
-                var short = extractNameFromAnchor(a);
-                if (!short || short.length < 2) return;
-                // Only use if it looks like an abbreviated name (ends with letter + optional dot)
-                if (!/[A-Z][a-z]/.test(short)) return;
-                if (nameMap[short]) return; // already have it
-                var full = slugToFull(slug, short);
-                if (full && full !== short) nameMap[short] = full;
-            });
-
-            // Source 3: title / aria-label / data-* attributes on any child element
-            [starterSides[0], starterSides[1]].forEach(function(el) {
-                el.querySelectorAll('*').forEach(function(child) {
-                    var inner = (child.childElementCount === 0
-                        ? (child.innerText || child.textContent || '')
-                        : '').trim();
-                    if (!inner || inner.length < 3) return;
-                    var candidates = [
-                        child.getAttribute('title'),
-                        child.getAttribute('aria-label'),
-                        child.getAttribute('data-name'),
-                        child.getAttribute('data-player-name'),
-                        child.getAttribute('data-fullname'),
-                    ];
-                    candidates.forEach(function(attr) {
-                        if (!attr || attr.length <= inner.length) return;
-                        // Attribute looks like a full name (has a space, starts with letter)
-                        if (!/^[A-Za-z]/.test(attr) || attr.indexOf(' ') < 0) return;
-                        // Attribute shares a meaningful word with the inner text
-                        var innerWords = inner.split(/[\s.]+/).filter(function(w) { return w.length > 2; });
-                        var overlap = innerWords.some(function(w) {
-                            return attr.toLowerCase().indexOf(w.toLowerCase()) >= 0;
-                        });
-                        if (overlap) nameMap[inner] = attr;
-                    });
-                });
-            });
 
             function enrich(el) {
                 var text = (el.innerText || el.textContent || '').trim();
-                // Apply replacements longest-key-first to avoid partial overwrites
                 Object.keys(nameMap)
                     .sort(function(a, b) { return b.length - a.length; })
                     .forEach(function(short) {
@@ -1376,13 +1309,8 @@ def extract_lineups(page, summary: dict, api_name_map: dict = None) -> dict:
                 return text;
             }
 
-            // Detect positional line groups.
-            // Strategy 1: CSS class selectors (fast).
-            // Strategy 2: Y-position clustering via player profile links.
-            // Fallback: flat text of the whole side element (always works).
             function enrichWithGroups(sideEl) {
                 try {
-                    // --- Strategy 1: CSS class selectors ---
                     var SELECTORS = [
                         '[class*="lf__line"]',
                         '[class*="lineUp__line"]',
@@ -1398,54 +1326,10 @@ def extract_lineups(page, summary: dict, api_name_map: dict = None) -> dict:
                                         .join('\n___GROUP___\n');
                         }
                     }
-
-                    // --- Strategy 2: Y-position clustering via player links ---
-                    var playerAnchors = Array.from(sideEl.querySelectorAll('a[href*="/speler/"],a[href*="/player/"]'));
-                    if (playerAnchors.length >= 8) {
-                        var items = playerAnchors.map(function(el) {
-                            var r = el.getBoundingClientRect();
-                            return { el: el, y: r.top + r.height / 2 };
-                        }).filter(function(it) { return it.y > 0; });
-
-                        if (items.length >= 8) {
-                            items.sort(function(a, b) { return a.y - b.y; });
-
-                            // Cluster: new group when Y gap > BAND px
-                            var BAND = 25;
-                            var groups = [[items[0]]];
-                            for (var ii = 1; ii < items.length; ii++) {
-                                if (items[ii].y - items[ii - 1].y > BAND) groups.push([]);
-                                groups[groups.length - 1].push(items[ii]);
-                            }
-
-                            // Valid formation: 3–5 groups, 8–15 total players
-                            if (groups.length >= 2 && groups.length <= 6 && items.length >= 8) {
-                                var result = groups.map(function(grp) {
-                                    var texts = grp.map(function(it) {
-                                        return (it.el.innerText || it.el.textContent || '').trim();
-                                    }).filter(Boolean);
-                                    var raw = texts.join('\n');
-                                    Object.keys(nameMap)
-                                        .sort(function(a, b) { return b.length - a.length; })
-                                        .forEach(function(short) {
-                                            if (raw.indexOf(short) >= 0)
-                                                raw = raw.split(short).join(nameMap[short]);
-                                        });
-                                    return raw;
-                                }).join('\n___GROUP___\n');
-                                // Sanity: result must contain at least 5 newlines (= 6+ names)
-                                if ((result.match(/\n/g) || []).length >= 5) return result;
-                            }
-                        }
-                    }
                 } catch(e2) {}
-
-                // Fallback: flat text (always produces output)
                 return enrich(sideEl);
             }
 
-            // Flashscore DOM order: home team = index 0, away team = index 1
-            // Store diagnostics globally so Python can read them after evaluate()
             window.__lastNmSize      = Object.keys(nameMap).length;
             window.__lastNmKeys      = Object.keys(nameMap).slice(0, 20);
             window.__lastPlayerLinks = document.querySelectorAll('a[href*="/speler/"],a[href*="/player/"]').length;
@@ -1456,6 +1340,7 @@ def extract_lineups(page, summary: dict, api_name_map: dict = None) -> dict:
                 nameMapSize:  Object.keys(nameMap).length,
                 playerLinks:  window.__lastPlayerLinks,
                 nameMapKeys:  window.__lastNmKeys,
+                strategy: 'lf__side-fallback',
             };
         })()
         """)
@@ -2079,50 +1964,24 @@ def scrape_match(url: str) -> str:
             # Enrich events with API names already available
             apply_names_to_events(summary["events"], api_name_map)
 
-            # Navigate to OPSTELLINGEN tab
-            clicked = False
-            for label in ("OPSTELLINGEN", "Opstellingen", "LINEUPS", "Lineups"):
-                try:
-                    page.get_by_text(label, exact=True).first.click(timeout=3000)
-                    clicked = True
-                    print(f"[tab] geklikt via exact='{label}'")
-                    break
-                except Exception:
-                    pass
-            if not clicked:
-                # Try without exact match
-                for label in ("OPSTELLINGEN", "Opstellingen"):
-                    try:
-                        page.get_by_text(label).first.click(timeout=3000)
-                        clicked = True
-                        print(f"[tab] geklikt via fuzzy='{label}'")
-                        break
-                    except Exception:
-                        pass
-            if not clicked:
-                # Try via JavaScript — look for tab buttons/links containing the keyword
-                try:
-                    clicked = page.evaluate("""(function() {
-                        var keywords = ['opstellingen', 'lineups', 'lineup'];
-                        var els = Array.from(document.querySelectorAll('a,button,[role="tab"]'));
-                        for (var i = 0; i < els.length; i++) {
-                            var t = (els[i].innerText || els[i].textContent || '').toLowerCase().trim();
-                            var h = (els[i].getAttribute('href') || '').toLowerCase();
-                            for (var k = 0; k < keywords.length; k++) {
-                                if (t === keywords[k] || h.indexOf(keywords[k]) >= 0) {
-                                    els[i].click();
-                                    return true;
-                                }
-                            }
-                        }
-                        return false;
-                    })()""")
-                    if clicked:
-                        print("[tab] geklikt via JavaScript fallback")
-                except Exception:
-                    pass
-            if not clicked:
-                print("[tab] MISLUKT — tab niet gevonden")
+            # Navigate directly to opstellingen URL (more reliable than clicking tab)
+            opstel_url = url
+            if '?mid=' in url:
+                base_match_url, mid_qs = url.split('?mid=', 1)
+                opstel_url = base_match_url.rstrip('/') + '/samenvatting/opstellingen/?mid=' + mid_qs
+            elif '?' in url:
+                base_part, qs_part = url.split('?', 1)
+                opstel_url = base_part.rstrip('/') + '/samenvatting/opstellingen/?' + qs_part
+            else:
+                opstel_url = url.rstrip('/') + '/samenvatting/opstellingen/'
+            print(f"[tab] navigeer naar opstellingen URL: {opstel_url}")
+            try:
+                page.goto(opstel_url, wait_until="domcontentloaded", timeout=30000)
+                clicked = True
+                print("[tab] opstellingen URL geladen")
+            except Exception as _nav_exc:
+                clicked = False
+                print(f"[tab] MISLUKT — URL navigatie: {_nav_exc}")
 
             lineups = {"home_starters": [], "away_starters": []}
             if clicked:
