@@ -1167,7 +1167,43 @@ def extract_lineups(page, summary: dict, api_name_map: dict = None) -> dict:
                     return (s.innerText || '').trim().length > 20;
                 });
                 if (filled.length >= 2) starterSides = filled;
-                else return { home: '', away: '' };
+            }
+
+            // Strategy B: content-based — survives CSS class renames
+            if (starterSides.length < 2) {
+                var ALL_TAGS = ['div','section','ul','ol','article'];
+                var candidates = [];
+                ALL_TAGS.forEach(function(tag) {
+                    Array.from(document.querySelectorAll(tag)).forEach(function(el) {
+                        var text = (el.innerText || el.textContent || '').trim();
+                        var kCount = (text.match(/\(K\)/g) || []).length;
+                        if (kCount !== 1) return;
+                        var links = el.querySelectorAll('a[href*="/speler/"],a[href*="/player/"]');
+                        if (links.length < 8) return;
+                        var innerK = Array.from(el.querySelectorAll(tag)).filter(function(child) {
+                            var ct = (child.innerText || child.textContent || '').trim();
+                            return (ct.match(/\(K\)/g) || []).length === 1
+                                   && child.querySelectorAll('a[href*="/speler/"],a[href*="/player/"]').length >= 8;
+                        });
+                        if (innerK.length > 0) return;
+                        candidates.push(el);
+                    });
+                });
+                candidates = candidates.filter(function(el) {
+                    return !candidates.some(function(other) {
+                        return other !== el && el.contains(other);
+                    });
+                });
+                if (candidates.length >= 2) {
+                    starterSides = candidates.slice(0, 2);
+                }
+            }
+
+            if (starterSides.length < 2) {
+                return { home: '', away: '',
+                         debug: 'sides_not_found lf__side_count=' +
+                             document.querySelectorAll('[class*="lf__side"]').length +
+                             ' K_count=' + (document.body.innerText.match(/\(K\)/g)||[]).length };
             }
 
             // Build a map of abbreviated name -> full name from multiple sources
@@ -1423,8 +1459,14 @@ def extract_lineups(page, summary: dict, api_name_map: dict = None) -> dict:
             };
         })()
         """)
-    except Exception:
+    except Exception as _lineup_exc:
         raw = {"home": "", "away": ""}
+        print(f"[lineup] exception: {_lineup_exc}")
+
+    if raw.get("debug"):
+        print(f"[lineup] {raw['debug']}")
+    elif not raw.get("home"):
+        print("[lineup] home leeg na evaluate")
 
     # Apply API-derived full names (most reliable source — from XHR responses)
     if api_name_map:
@@ -2043,6 +2085,7 @@ def scrape_match(url: str) -> str:
                 try:
                     page.get_by_text(label, exact=True).first.click(timeout=3000)
                     clicked = True
+                    print(f"[tab] geklikt via exact='{label}'")
                     break
                 except Exception:
                     pass
@@ -2052,6 +2095,7 @@ def scrape_match(url: str) -> str:
                     try:
                         page.get_by_text(label).first.click(timeout=3000)
                         clicked = True
+                        print(f"[tab] geklikt via fuzzy='{label}'")
                         break
                     except Exception:
                         pass
@@ -2073,8 +2117,12 @@ def scrape_match(url: str) -> str:
                         }
                         return false;
                     })()""")
+                    if clicked:
+                        print("[tab] geklikt via JavaScript fallback")
                 except Exception:
                     pass
+            if not clicked:
+                print("[tab] MISLUKT — tab niet gevonden")
 
             lineups = {"home_starters": [], "away_starters": []}
             if clicked:
