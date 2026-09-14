@@ -1976,9 +1976,14 @@ def scrape_match(url: str) -> str:
                 opstel_url = url.rstrip('/') + '/samenvatting/opstellingen/'
             print(f"[tab] navigeer naar opstellingen URL: {opstel_url}")
             try:
-                page.goto(opstel_url, wait_until="domcontentloaded", timeout=30000)
+                # Use JS navigation (looks like in-app SPA click, not Playwright goto)
+                page.evaluate(f"window.location.href = '{opstel_url}'")
+                # Wait for domcontentloaded on the new page
+                page.wait_for_load_state("domcontentloaded", timeout=30000)
+                # Extra wait for React/SPA to hydrate
+                page.wait_for_timeout(3000)
                 clicked = True
-                print("[tab] opstellingen URL geladen")
+                print(f"[tab] opstellingen URL geladen via JS nav, title={page.title()!r}")
             except Exception as _nav_exc:
                 clicked = False
                 print(f"[tab] MISLUKT — URL navigatie: {_nav_exc}")
